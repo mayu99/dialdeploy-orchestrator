@@ -34,6 +34,7 @@ async def spawn(repo: str, message: str, env_vars: Dict[str, str] = None, agent:
         return mock_id
 
     payload = {
+        "name": f"dialdeploy-{repo.split('/')[-1]}-{os.urandom(4).hex()}",
         "repository": repo,
         "message": message,
         "coding_agent": agent
