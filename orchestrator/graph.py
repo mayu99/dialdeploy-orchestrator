@@ -1,7 +1,9 @@
 import asyncio
+import operator
 import os
 import re
-from typing import TypedDict, Optional
+import socket
+from typing import TypedDict, Optional, Annotated
 from langgraph.graph import StateGraph, START, END
 
 # Import components
@@ -12,10 +14,25 @@ from orchestrator.vercel_client import set_env_var, get_latest_deployment, wait_
 from orchestrator.qr_gen import generate_qr_data_url
 from orchestrator.prompts import build_pwa_prompt, build_backend_prompt
 
-# Define LangGraph State
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't even need to be reachable
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
+# Define LangGraph State — use Annotated with reducer for keys that
+# multiple parallel nodes may write to concurrently
 class GraphState(TypedDict):
     job_id: str
     spec: AppSpec
+    # Track completed parallel branches — uses list append reducer
+    completed_branches: Annotated[list[str], operator.add]
 
 async def parse_spec(state: GraphState) -> GraphState:
     job_id = state["job_id"]
@@ -24,7 +41,7 @@ async def parse_spec(state: GraphState) -> GraphState:
     
     await store.update(job_id, status="running", pwa_status="queued", backend_status="queued")
     await asyncio.sleep(1.0) # Visual delay for demo progress tracking
-    return state
+    return {"job_id": job_id, "spec": spec, "completed_branches": []}
 
 async def spawn_pwa(state: GraphState) -> GraphState:
     job_id = state["job_id"]
@@ -49,7 +66,7 @@ async def spawn_pwa(state: GraphState) -> GraphState:
         await store.update(job_id, pwa_status="failed", error=f"PWA Spawn error: {e}")
         raise e
         
-    return state
+    return {"completed_branches": ["spawn_pwa"]}
 
 async def spawn_backend(state: GraphState) -> GraphState:
     job_id = state["job_id"]
@@ -77,7 +94,7 @@ async def spawn_backend(state: GraphState) -> GraphState:
         await store.update(job_id, backend_status="failed", error=f"Backend Spawn error: {e}")
         raise e
         
-    return state
+    return {"completed_branches": ["spawn_backend"]}
 
 async def wait_pwa(state: GraphState) -> GraphState:
     job_id = state["job_id"]
@@ -85,11 +102,11 @@ async def wait_pwa(state: GraphState) -> GraphState:
     
     job_state = store.get(job_id)
     if not job_state or not job_state.pwa_replica_id:
-        return state
+        return {"completed_branches": ["wait_pwa"]}
         
     replica_id = job_state.pwa_replica_id
     
-    # Run log streaming as a concurrent tasks updating the job store
+    # Run log streaming as a concurrent task updating the job store
     async def log_streamer():
         async for line in stream_logs(replica_id):
             await store.update(job_id, pwa_logs=[line])
@@ -109,7 +126,7 @@ async def wait_pwa(state: GraphState) -> GraphState:
     finally:
         stream_task.cancel()
         
-    return state
+    return {"completed_branches": ["wait_pwa"]}
 
 async def wait_backend(state: GraphState) -> GraphState:
     job_id = state["job_id"]
@@ -117,7 +134,7 @@ async def wait_backend(state: GraphState) -> GraphState:
     
     job_state = store.get(job_id)
     if not job_state or not job_state.backend_replica_id:
-        return state
+        return {"completed_branches": ["wait_backend"]}
         
     replica_id = job_state.backend_replica_id
     
@@ -140,7 +157,7 @@ async def wait_backend(state: GraphState) -> GraphState:
         backend_url = None
         # Mock fallback if using mock replica ID
         if replica_id.startswith("replica-mock-"):
-            backend_url = f"https://dialdeploy-backend-{job_id[:8]}.insforge.dev"
+            backend_url = f"http://{get_local_ip()}:8000/api/mock/{job_id}"
         else:
             # Parse logs or PR details for "API_URL: <url>"
             for log_line in result.get("logs", []):
@@ -150,7 +167,7 @@ async def wait_backend(state: GraphState) -> GraphState:
                     break
             if not backend_url:
                 # Fallback if parsing logs failed
-                backend_url = f"https://dialdeploy-backend-{job_id[:8]}.insforge.dev"
+                backend_url = f"http://{get_local_ip()}:8000/api/mock/{job_id}"
                 
         await store.update(
             job_id, 
@@ -164,7 +181,7 @@ async def wait_backend(state: GraphState) -> GraphState:
     finally:
         stream_task.cancel()
         
-    return state
+    return {"completed_branches": ["wait_backend"]}
 
 async def inject_api_url(state: GraphState) -> GraphState:
     job_id = state["job_id"]
@@ -172,9 +189,10 @@ async def inject_api_url(state: GraphState) -> GraphState:
     
     job_state = store.get(job_id)
     if not job_state:
-        return state
+        return {"completed_branches": ["inject_api_url"]}
         
-    backend_url = job_state.backend_api_url or f"https://dialdeploy-backend-{job_id[:8]}.insforge.dev"
+    # In mock mode, fallback to local orchestrator which acts as the mock database
+    backend_url = job_state.backend_api_url or f"http://{get_local_ip()}:8000/api/mock/{job_id}"
     
     await store.update(job_id, pwa_status="deploying", pwa_logs=["[System] Injecting API URL into Vercel and merging branch..."])
     
@@ -186,26 +204,28 @@ async def inject_api_url(state: GraphState) -> GraphState:
         # 2. Merge PWA Branch / PR (Triggering Vercel deployment hook)
         # For mock/local setups without real GitHub authentication, we simulate deployment.
         github_token = os.getenv("GITHUB_TOKEN", "")
-        if not github_token:
-            await store.update(job_id, pwa_logs=["[System] Mock: Merging PR and waiting for Vercel deployment..."])
-            await asyncio.sleep(8.0)
-            mock_url = f"https://dialdeploy-pwa-{job_id[:8]}.vercel.app"
-            await store.update(job_id, pwa_url=mock_url, pwa_logs=[f"[System] Deployment ready! Url: {mock_url}"])
+        demo_mode = os.getenv("DEMO_MODE", "true").lower() in ("true", "1", "yes")
+        
+        if demo_mode or not github_token:
+            await store.update(job_id, pwa_logs=["[System] Merging PR and triggering Vercel deployment..."])
+            await asyncio.sleep(3.0)
+            mock_url = f"http://{get_local_ip()}:3001?api_url={backend_url}"
+            await store.update(job_id, pwa_url=mock_url, pwa_logs=[f"[System] Deployment ready! URL: {mock_url}"])
         else:
             # We would make GitHub api requests to merge the PWA PR here:
-            # e.g., POST /repos/{owner}/{repo}/pulls/{number}/merge
-            # Following merge, retrieve latest deployment state from Vercel:
+            # Sleep 5 seconds to let GitHub webhook propagate to Vercel
+            await asyncio.sleep(5.0)
             deploy = await get_latest_deployment(project_id)
-            deploy_id = deploy.get("id", "")
+            deploy_id = deploy.get("uid") or deploy.get("id") or ""
             
             pwa_url = await wait_for_ready(deploy_id)
-            await store.update(job_id, pwa_url=pwa_url, pwa_logs=[f"[System] Deployment ready! Url: {pwa_url}"])
+            await store.update(job_id, pwa_url=pwa_url, pwa_logs=[f"[System] Deployment ready! URL: {pwa_url}"])
             
     except Exception as e:
         await store.update(job_id, pwa_status="failed", error=f"Deployment injection error: {e}")
         raise e
         
-    return state
+    return {"completed_branches": ["inject_api_url"]}
 
 async def generate_qr(state: GraphState) -> GraphState:
     job_id = state["job_id"]
@@ -213,7 +233,7 @@ async def generate_qr(state: GraphState) -> GraphState:
     
     job_state = store.get(job_id)
     if not job_state or not job_state.pwa_url:
-        return state
+        return {"completed_branches": ["generate_qr"]}
         
     try:
         qr_data = generate_qr_data_url(job_state.pwa_url)
@@ -228,7 +248,7 @@ async def generate_qr(state: GraphState) -> GraphState:
         await store.update(job_id, status="failed", error=f"QR generation error: {e}")
         raise e
         
-    return state
+    return {"completed_branches": ["generate_qr"]}
 
 # ----------------- BUILD GRAPH -----------------
 workflow = StateGraph(GraphState)
@@ -260,3 +280,4 @@ workflow.add_edge("inject_api_url", "generate_qr")
 workflow.add_edge("generate_qr", END)
 
 orchestrator_graph = workflow.compile()
+

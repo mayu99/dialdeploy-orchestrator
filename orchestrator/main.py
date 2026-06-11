@@ -86,6 +86,106 @@ async def get_job_qr(job_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to decode QR code: {e}")
 
+from uuid import uuid4
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+
+class MockItem(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
+    completed: bool = False
+    created_at: str
+
+class CreateMockItemInput(BaseModel):
+    title: str
+    description: Optional[str] = None
+
+class UpdateMockItemInput(BaseModel):
+    completed: Optional[bool] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+
+from collections import defaultdict
+from typing import Dict
+
+# In-memory store for mock items partitioned by job_id
+mock_items_db: Dict[str, List[MockItem]] = defaultdict(list)
+
+@app.get("/items", response_model=List[MockItem])
+async def list_mock_items():
+    return mock_items_db["default"]
+
+@app.post("/items", response_model=MockItem)
+async def create_mock_item(item_input: CreateMockItemInput):
+    new_item = MockItem(
+        id=str(uuid4()),
+        title=item_input.title,
+        description=item_input.description,
+        completed=False,
+        created_at=datetime.utcnow().isoformat() + "Z"
+    )
+    mock_items_db["default"].append(new_item)
+    return new_item
+
+@app.get("/items/{item_id}", response_model=MockItem)
+async def get_mock_item(item_id: str):
+    for item in mock_items_db["default"]:
+        if item.id == item_id:
+            return item
+    raise HTTPException(status_code=404, detail="Item not found")
+
+@app.patch("/items/{item_id}", response_model=MockItem)
+async def update_mock_item(item_id: str, item_input: UpdateMockItemInput):
+    for item in mock_items_db["default"]:
+        if item.id == item_id:
+            if item_input.completed is not None:
+                item.completed = item_input.completed
+            if item_input.title is not None:
+                item.title = item_input.title
+            if item_input.description is not None:
+                item.description = item_input.description
+            return item
+    raise HTTPException(status_code=404, detail="Item not found")
+
+# Partitioned endpoints
+@app.get("/api/mock/{job_id}/items", response_model=List[MockItem])
+async def list_partitioned_mock_items(job_id: str):
+    return mock_items_db[job_id]
+
+@app.post("/api/mock/{job_id}/items", response_model=MockItem)
+async def create_partitioned_mock_item(job_id: str, item_input: CreateMockItemInput):
+    new_item = MockItem(
+        id=str(uuid4()),
+        title=item_input.title,
+        description=item_input.description,
+        completed=False,
+        created_at=datetime.utcnow().isoformat() + "Z"
+    )
+    mock_items_db[job_id].append(new_item)
+    return new_item
+
+@app.get("/api/mock/{job_id}/items/{item_id}", response_model=MockItem)
+async def get_partitioned_mock_item(job_id: str, item_id: str):
+    for item in mock_items_db[job_id]:
+        if item.id == item_id:
+            return item
+    raise HTTPException(status_code=404, detail="Item not found")
+
+@app.patch("/api/mock/{job_id}/items/{item_id}", response_model=MockItem)
+async def update_partitioned_mock_item(job_id: str, item_id: str, item_input: UpdateMockItemInput):
+    for item in mock_items_db[job_id]:
+        if item.id == item_id:
+            if item_input.completed is not None:
+                item.completed = item_input.completed
+            if item_input.title is not None:
+                item.title = item_input.title
+            if item_input.description is not None:
+                item.description = item_input.description
+            return item
+    raise HTTPException(status_code=404, detail="Item not found")
+
 @app.get("/health")
 async def health_check():
     return {"ok": True, "jobs_allocated": JOBS_THIS_SESSION}

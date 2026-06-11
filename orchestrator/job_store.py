@@ -96,7 +96,10 @@ class JobStore:
         except asyncio.CancelledError:
             # Unsubscribe on connection drop
             if job_id in self._queues:
-                self._queues[job_id].discard(queue)
+                try:
+                    self._queues[job_id].remove(queue)
+                except ValueError:
+                    pass
             raise
 
 # Singleton instance
